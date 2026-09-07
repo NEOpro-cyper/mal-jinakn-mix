@@ -2,6 +2,7 @@ import https from 'node:https';
 import { URL } from 'node:url';
 import { MAL_API_URL, MAL_CLIENT_ID, ITEMS_PER_PAGE, CACHE_TTL_SECONDS } from './config';
 import { redisGet, redisSet } from './redis';
+import { getProxyAgent, getDirectAgent, isProxyConnectError, resolveThrottleMs, PROXY_ENABLED, PROXY_FALLBACK_DIRECT, proxyLabel } from './proxy';
 
 // ============================================================
 // MAL Official API v2 — REST client + transforms
@@ -12,7 +13,11 @@ import { redisGet, redisSet } from './redis';
 // https://myanimelist.net/apiconfig). No OAuth flow needed for public
 // read endpoints.
 //
-// Rate limit: ~2-3 req/s per IP. We throttle to ~350ms between requests.
+// Rate limit: ~2-3 req/s per IP. All requests go through the Webshare
+// ROTATING proxy (fresh exit IP per request) when configured, which
+// lifts the per-IP cap; pacing is tightened accordingly and remains
+// overridable via MAL_THROTTLE_MS. See proxy.ts for the routing +
+// direct-fallback semantics.
 // ============================================================
 
 // --- Redis cache helpers (re-exported for routes) ---
@@ -37,38 +42,40 @@ export async function setCache(prefix: string, parts: string[], data: unknown, t
 //    after ~250ms when both IPv4 and IPv6 fail in parallel.
 // 2. Force `ALPNProtocols: ['http/1.1']` to skip the slow h2 negotiation
 //    that MAL's TLS endpoint doesn't support anyway.
-// 3. Throttle to ~3 req/s to respect MAL's free-tier rate limit.
+// 3. Throttle to stay under MAL's free-tier limit (pacing auto-tightens
+//    when the rotating proxy is active; override with MAL_THROTTLE_MS).
 // 4. Retry on 429/5xx with exponential backoff.
 
+// Pacing: 150ms (~6.7 req/s) across rotating exit IPs, 350ms (~2.9 req/s)
+// when pinned to the server's own IP. MAL_THROTTLE_MS overrides both.
+export const MAL_RESOLVED_INTERVAL_MS = resolveThrottleMs('MAL_THROTTLE_MS', 150, 350);
+
 let lastReqAt = 0;
-const MAL_MIN_INTERVAL_MS = 350;
 
 async function throttle() {
   const now = Date.now();
-  const wait = MAL_MIN_INTERVAL_MS - (now - lastReqAt);
+  const wait = MAL_RESOLVED_INTERVAL_MS - (now - lastReqAt);
   if (wait > 0) await new Promise((r) => setTimeout(r, wait));
   lastReqAt = Date.now();
 }
 
-const SHARED_HTTPS_AGENT = new https.Agent({
-  keepAlive: true,
-  family: 4,                  // IPv4 only — sandbox has no IPv6 route
-  ALPNProtocols: ['http/1.1'], // MAL's TLS doesn't speak h2
-});
-
-function rawHttpsGet(url: URL, headers: Record<string, string>, timeoutMs: number): Promise<{ status: number; body: string }> {
+/**
+ * One HTTPS GET attempt through the given agent.
+ * `agent` comes from proxy.ts: the rotating proxy agent (keepAlive: false,
+ * fresh exit IP per call) or the shared direct agent.
+ */
+function httpsGetOnce(url: URL, headers: Record<string, string>, timeoutMs: number, agent: https.Agent): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
-    // Type-cast to `https.RequestOptions & Record<string, unknown>` because
-    // older Node typings don't include `ALPNProtocols` (it does work at runtime).
+    // Type-cast to `https.RequestOptions` because older Node typings don't
+    // include `ALPNProtocols` (it does work at runtime).
     const opts = {
       method: 'GET',
       hostname: url.hostname,
       port: url.port || 443,
       path: url.pathname + url.search,
       headers,
-      family: 4,
       ALPNProtocols: ['http/1.1'],
-      agent: SHARED_HTTPS_AGENT,
+      agent,
       timeout: timeoutMs,
     } as https.RequestOptions;
     const req = https.request(opts, (res) => {
@@ -80,6 +87,42 @@ function rawHttpsGet(url: URL, headers: Record<string, string>, timeoutMs: numbe
     req.on('timeout', () => req.destroy(new Error(`request timeout after ${timeoutMs}ms`)));
     req.end();
   });
+}
+
+/**
+ * Routed GET: through the rotating proxy first; on a proxy-side failure
+ * (unreachable proxy, rejected credentials/407, dropped tunnel) retry ONCE
+ * direct instead of failing the whole request. Origin API statuses
+ * (4xx/5xx from MAL) are returned as-is — the retry loop below owns those.
+ *
+ * NOTE on 407: https-proxy-agent deliberately REPLAYS the proxy's 407
+ * response as the request's HTTP response (so credentials never reach a
+ * misbehaving proxy — see hackerone 541502). That means "proxy rejected
+ * our credentials" shows up as res.status === 407, not as a thrown error,
+ * and must be handled as a proxy-side failure here.
+ */
+async function rawHttpsGet(url: URL, headers: Record<string, string>, timeoutMs: number): Promise<{ status: number; body: string }> {
+  const proxyAgent = getProxyAgent();
+  if (!proxyAgent) return httpsGetOnce(url, headers, timeoutMs, getDirectAgent());
+
+  let proxied: { status: number; body: string };
+  try {
+    proxied = await httpsGetOnce(url, headers, timeoutMs, proxyAgent);
+  } catch (err) {
+    if (!PROXY_FALLBACK_DIRECT || !isProxyConnectError(err)) throw err;
+    console.warn(
+      `[mal] proxy tunnel failed (${(err as Error).message}) — falling back to direct for ${url.pathname}`
+    );
+    return httpsGetOnce(url, headers, timeoutMs, getDirectAgent());
+  }
+
+  if (proxied.status === 407) {
+    console.warn('[mal] proxy rejected credentials (HTTP 407) — check PROXY_USER/PROXY_PASS in .env');
+    if (!PROXY_FALLBACK_DIRECT) return proxied;
+    return httpsGetOnce(url, headers, timeoutMs, getDirectAgent());
+  }
+
+  return proxied;
 }
 
 /**
@@ -133,13 +176,19 @@ export async function malFetch<T = Record<string, unknown>>(
       }
 
       if (res.status >= 400) {
-        throw new Error(`MAL API HTTP ${res.status} — ${res.body.slice(0, 300)}`);
+        // Tag with a code so the catch block below does NOT retry it —
+        // retrying a 400/401/403 (bad query, rejected client ID) is pointless.
+        const err = new Error(`MAL API HTTP ${res.status} — ${res.body.slice(0, 300)}`) as NodeJS.ErrnoException;
+        err.code = 'EMALSTATUS';
+        throw err;
       }
 
       try {
         return JSON.parse(res.body) as T;
       } catch {
-        throw new Error(`MAL API returned non-JSON response (status ${res.status}): ${res.body.slice(0, 200)}`);
+        const err = new Error(`MAL API returned non-JSON response (status ${res.status}): ${res.body.slice(0, 200)}`) as NodeJS.ErrnoException;
+        err.code = 'EJSONPARSE';
+        throw err;
       }
     } catch (err) {
       lastErr = err;
