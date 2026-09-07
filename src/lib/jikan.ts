@@ -3,6 +3,7 @@ import { URL } from 'node:url';
 import { JIKAN_URL, CACHE_TTL_SECONDS } from './config';
 import { redisGet, redisSet } from './redis';
 import { slugify } from './mal';
+import { getProxyAgent, getDirectAgent, isProxyConnectError, resolveThrottleMs, PROXY_FALLBACK_DIRECT } from './proxy';
 
 // ============================================================
 // JIKAN v4 — unofficial MAL scraper API. Public, no auth.
@@ -15,8 +16,12 @@ import { slugify } from './mal';
 //   - GET /anime/{id}/episodes   → richer episode metadata (titles, filler
 //     flags) than the official API, which returns none of this.
 //
-// Rate limit: 3 req/s, 60 req/min (community-run, no uptime guarantee) —
-// keep this behind mal.ts/anilist.ts in call order, never as primary source.
+// Rate limit: 3 req/s + 60 req/min per IP (community-run, no uptime
+// guarantee). All requests go through the Webshare ROTATING proxy (fresh
+// exit IP per request) when configured, so the per-IP caps stop applying
+// to the server's own address. Pacing stays polite by default (Jikan is
+// free/community-run) and is overridable via JIKAN_THROTTLE_MS.
+// Keep this behind mal.ts/anilist.ts in call order, never as primary source.
 // ============================================================
 
 function buildKey(prefix: string, ...parts: string[]): string {
@@ -31,28 +36,30 @@ export async function setCache(prefix: string, parts: string[], data: unknown, t
   await redisSet(buildKey(prefix, ...parts), data, ttl);
 }
 
-// --- REST fetch (same rationale as mal.ts: native https, IPv4-only, http/1.1) ---
+// --- REST fetch (same rationale as mal.ts: native https, http/1.1) ---
+//
+// Pacing: Jikan's 3 req/s + 60/min caps are per-IP, and with per-request
+// exit-IP rotation they stop binding — but Jikan is a free community
+// service, so the default stays polite at 400ms (~2.5 req/s) either way.
+// JIKAN_THROTTLE_MS overrides it if you want to push harder.
+const JIKAN_RESOLVED_INTERVAL_MS = resolveThrottleMs('JIKAN_THROTTLE_MS', 400, 400);
+export { JIKAN_RESOLVED_INTERVAL_MS };
 
-const SHARED_HTTPS_AGENT = new https.Agent({
-  keepAlive: true,
-  family: 4,
-  ALPNProtocols: ['http/1.1'],
-});
-
-// Jikan's hard limit is 3/s and 60/min. 400ms between requests gives 2.5 req/s
-// (a little headroom under the per-second cap) and naturally caps us at
-// 150 req/min max burst, well under the per-minute cap too.
 let lastReqAt = 0;
-const JIKAN_MIN_INTERVAL_MS = 400;
 
 async function throttle() {
   const now = Date.now();
-  const wait = JIKAN_MIN_INTERVAL_MS - (now - lastReqAt);
+  const wait = JIKAN_RESOLVED_INTERVAL_MS - (now - lastReqAt);
   if (wait > 0) await new Promise((r) => setTimeout(r, wait));
   lastReqAt = Date.now();
 }
 
-function rawHttpsGet(url: URL, timeoutMs: number): Promise<{ status: number; body: string }> {
+/**
+ * One HTTPS GET attempt through the given agent.
+ * `agent` comes from proxy.ts: the rotating proxy agent (keepAlive: false,
+ * fresh exit IP per call) or the shared direct agent.
+ */
+function httpsGetOnce(url: URL, timeoutMs: number, agent: https.Agent): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const opts = {
       method: 'GET',
@@ -60,9 +67,8 @@ function rawHttpsGet(url: URL, timeoutMs: number): Promise<{ status: number; bod
       port: url.port || 443,
       path: url.pathname + url.search,
       headers: { Accept: 'application/json', 'User-Agent': 'cine-mal-api/1.0' },
-      family: 4,
       ALPNProtocols: ['http/1.1'],
-      agent: SHARED_HTTPS_AGENT,
+      agent,
       timeout: timeoutMs,
     } as https.RequestOptions;
     const req = https.request(opts, (res) => {
@@ -74,6 +80,42 @@ function rawHttpsGet(url: URL, timeoutMs: number): Promise<{ status: number; bod
     req.on('timeout', () => req.destroy(new Error(`request timeout after ${timeoutMs}ms`)));
     req.end();
   });
+}
+
+/**
+ * Routed GET: through the rotating proxy first; on a proxy-side failure
+ * (unreachable proxy, rejected credentials/407, dropped tunnel) retry ONCE
+ * direct instead of failing the whole request. Origin API statuses are
+ * returned as-is — the retry loop in jikanFetch owns those.
+ *
+ * NOTE on 407: https-proxy-agent deliberately REPLAYS the proxy's 407
+ * response as the request's HTTP response (so credentials never reach a
+ * misbehaving proxy — see hackerone 541502). That means "proxy rejected
+ * our credentials" shows up as res.status === 407, not as a thrown error,
+ * and must be handled as a proxy-side failure here.
+ */
+async function rawHttpsGet(url: URL, timeoutMs: number): Promise<{ status: number; body: string }> {
+  const proxyAgent = getProxyAgent();
+  if (!proxyAgent) return httpsGetOnce(url, timeoutMs, getDirectAgent());
+
+  let proxied: { status: number; body: string };
+  try {
+    proxied = await httpsGetOnce(url, timeoutMs, proxyAgent);
+  } catch (err) {
+    if (!PROXY_FALLBACK_DIRECT || !isProxyConnectError(err)) throw err;
+    console.warn(
+      `[jikan] proxy tunnel failed (${(err as Error).message}) — falling back to direct for ${url.pathname}`
+    );
+    return httpsGetOnce(url, timeoutMs, getDirectAgent());
+  }
+
+  if (proxied.status === 407) {
+    console.warn('[jikan] proxy rejected credentials (HTTP 407) — check PROXY_USER/PROXY_PASS in .env');
+    if (!PROXY_FALLBACK_DIRECT) return proxied;
+    return httpsGetOnce(url, timeoutMs, getDirectAgent());
+  }
+
+  return proxied;
 }
 
 /**
@@ -114,16 +156,24 @@ export async function jikanFetch<T = Record<string, unknown>>(
       }
 
       if (res.status === 404) {
-        throw new Error(`Jikan 404 — ${url.pathname}${url.search}`);
+        const err = new Error(`Jikan 404 — ${url.pathname}${url.search}`) as NodeJS.ErrnoException;
+        err.code = 'EJIKANSTATUS';
+        throw err;
       }
       if (res.status >= 400) {
-        throw new Error(`Jikan API HTTP ${res.status} — ${res.body.slice(0, 300)}`);
+        // Tag with a code so the catch block below does NOT retry it —
+        // retrying a 400 (bad MAL ID format etc.) is pointless.
+        const err = new Error(`Jikan API HTTP ${res.status} — ${res.body.slice(0, 300)}`) as NodeJS.ErrnoException;
+        err.code = 'EJIKANSTATUS';
+        throw err;
       }
 
       try {
         return JSON.parse(res.body) as T;
       } catch {
-        throw new Error(`Jikan API returned non-JSON response (status ${res.status}): ${res.body.slice(0, 200)}`);
+        const err = new Error(`Jikan API returned non-JSON response (status ${res.status}): ${res.body.slice(0, 200)}`) as NodeJS.ErrnoException;
+        err.code = 'EJSONPARSE';
+        throw err;
       }
     } catch (err) {
       lastErr = err;
