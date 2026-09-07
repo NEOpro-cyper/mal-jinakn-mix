@@ -2,15 +2,20 @@ import https from 'node:https';
 import { URL } from 'node:url';
 import { ANILIST_URL, CACHE_TTL_SECONDS } from './config';
 import { redisGet, redisSet } from './redis';
+import { getProxyAgent, getDirectAgent, isProxyConnectError, resolveThrottleMs, PROXY_FALLBACK_DIRECT } from './proxy';
 
 // ============================================================
 // ANILIST GraphQL — used as a fallback for:
 //  1. Characters & voice actors (MAL API v2 doesn't expose them)
 //  2. MAL ID → AniList ID resolution (Miruro requires AniList IDs)
 //
-// AniList is public (no auth), no scraping, no rate-limit issues for
-// normal use (90 req/min anonymous). This is more reliable than Jikan
-// for the things the official MAL API can't return.
+// AniList is public (no auth). Rate limit: ~90 req/min per IP. All
+// requests go through the Webshare ROTATING proxy (fresh exit IP per
+// request) when configured, which lifts the per-IP cap; pacing is
+// tightened accordingly and remains overridable via ANILIST_THROTTLE_MS.
+// Retries: 3 attempts on 429/5xx/network errors, honoring Retry-After.
+// This is more reliable than Jikan for the things the official MAL API
+// can't return.
 // ============================================================
 
 function buildKey(prefix: string, ...parts: string[]): string {
@@ -25,42 +30,26 @@ export async function setCache(prefix: string, parts: string[], data: unknown, t
   await redisSet(buildKey(prefix, ...parts), data, ttl);
 }
 
-// Shared HTTPS agent — IPv4 only, HTTP/1.1 (AniList's TLS doesn't speak h2,
-// and the sandbox has no IPv6 route). Same reasoning as mal.ts.
-const SHARED_HTTPS_AGENT = new https.Agent({
-  keepAlive: true,
-  family: 4,
-  ALPNProtocols: ['http/1.1'],
-});
+// Pacing: 120ms (~8.3 req/s) across rotating exit IPs, 250ms (~4 req/s)
+// when pinned to the server's own IP (still under the 90 req/min cap).
+// ANILIST_THROTTLE_MS overrides both.
+export const ANILIST_RESOLVED_INTERVAL_MS = resolveThrottleMs('ANILIST_THROTTLE_MS', 120, 250);
 
-// AniList allows ~90 req/min anonymous; we throttle to be safe.
 let lastReqAt = 0;
-const ANILIST_MIN_INTERVAL_MS = 250;
 
 async function throttle() {
   const now = Date.now();
-  const wait = ANILIST_MIN_INTERVAL_MS - (now - lastReqAt);
+  const wait = ANILIST_RESOLVED_INTERVAL_MS - (now - lastReqAt);
   if (wait > 0) await new Promise((r) => setTimeout(r, wait));
   lastReqAt = Date.now();
 }
 
 /**
- * Run an AniList GraphQL query. Returns the `data` field of the GraphQL
- * response (already unwrapped). Throws on transport errors or GraphQL errors.
+ * One HTTPS POST attempt through the given agent.
+ * Returns status + headers + body so the retry loop can honor Retry-After.
  */
-export async function anilistQuery<T = Record<string, unknown>>(
-  query: string,
-  variables: Record<string, unknown> = {},
-  timeoutMs = 15000
-): Promise<T> {
-  const url = new URL(ANILIST_URL);
-  const bodyStr = JSON.stringify({ query, variables });
-
-  await throttle();
-
-  // Use https.request directly so the IPv4-only + HTTP/1.1 ALPN settings
-  // are respected (Node's `fetch` fails on IPv6-only hosts in this sandbox).
-  const responseBody = await new Promise<string>((resolve, reject) => {
+function httpsPostOnce(url: URL, bodyStr: string, timeoutMs: number, agent: https.Agent): Promise<{ status: number; retryAfter: number | null; body: string }> {
+  return new Promise((resolve, reject) => {
     // Cast to RequestOptions — older Node typings don't include ALPNProtocols.
     const opts = {
       method: 'POST',
@@ -77,27 +66,133 @@ export async function anilistQuery<T = Record<string, unknown>>(
         Referer: 'https://anilist.co/',
         'Content-Length': Buffer.byteLength(bodyStr),
       },
-      family: 4,
       ALPNProtocols: ['http/1.1'],
-      agent: SHARED_HTTPS_AGENT,
+      agent,
       timeout: timeoutMs,
     } as https.RequestOptions;
     const req = https.request(opts, (res) => {
       let data = '';
       res.on('data', (c: Buffer) => (data += c.toString('utf8')));
-      res.on('end', () => resolve(data));
+      res.on('end', () => {
+        const raHeader = res.headers['retry-after'];
+        const retryAfter = raHeader ? parseInt(Array.isArray(raHeader) ? raHeader[0] : raHeader, 10) : null;
+        resolve({
+          status: res.statusCode || 0,
+          retryAfter: retryAfter !== null && !isNaN(retryAfter) ? retryAfter : null,
+          body: data,
+        });
+      });
     });
     req.on('error', reject);
     req.on('timeout', () => req.destroy(new Error(`AniList request timeout after ${timeoutMs}ms`)));
     req.write(bodyStr);
     req.end();
   });
+}
+
+/**
+ * Routed POST: through the rotating proxy first; on a proxy-side failure
+ * (unreachable proxy, rejected credentials/407, dropped tunnel) retry ONCE
+ * direct instead of failing the whole request. Origin API statuses are
+ * returned as-is — the retry loop in anilistPost owns those.
+ *
+ * NOTE on 407: https-proxy-agent deliberately REPLAYS the proxy's 407
+ * response as the request's HTTP response (so credentials never reach a
+ * misbehaving proxy — see hackerone 541502). That means "proxy rejected
+ * our credentials" shows up as res.status === 407, not as a thrown error,
+ * and must be handled as a proxy-side failure here.
+ */
+async function anilistPostRaw(url: URL, bodyStr: string, timeoutMs: number): Promise<{ status: number; retryAfter: number | null; body: string }> {
+  const proxyAgent = getProxyAgent();
+  if (!proxyAgent) return httpsPostOnce(url, bodyStr, timeoutMs, getDirectAgent());
+
+  let proxied: { status: number; retryAfter: number | null; body: string };
+  try {
+    proxied = await httpsPostOnce(url, bodyStr, timeoutMs, proxyAgent);
+  } catch (err) {
+    if (!PROXY_FALLBACK_DIRECT || !isProxyConnectError(err)) throw err;
+    console.warn(
+      `[anilist] proxy tunnel failed (${(err as Error).message}) — falling back to direct`
+    );
+    return httpsPostOnce(url, bodyStr, timeoutMs, getDirectAgent());
+  }
+
+  if (proxied.status === 407) {
+    console.warn('[anilist] proxy rejected credentials (HTTP 407) — check PROXY_USER/PROXY_PASS in .env');
+    if (!PROXY_FALLBACK_DIRECT) return proxied;
+    return httpsPostOnce(url, bodyStr, timeoutMs, getDirectAgent());
+  }
+
+  return proxied;
+}
+
+/**
+ * POST with retries: 3 attempts on 429/5xx and network errors, with
+ * exponential backoff — or the server-provided Retry-After when present
+ * (capped at 10s so a slow caller isn't stuck for minutes).
+ */
+async function anilistPost(url: URL, bodyStr: string, timeoutMs: number): Promise<{ status: number; body: string }> {
+  const MAX_RETRIES = 3;
+  const RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
+  let lastErr: unknown;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    await throttle();
+    try {
+      const res = await anilistPostRaw(url, bodyStr, timeoutMs);
+
+      if (RETRY_STATUSES.has(res.status) && attempt < MAX_RETRIES) {
+        const backoffMs = res.retryAfter !== null
+          ? Math.min(res.retryAfter * 1000, 10000)
+          : 1000 * Math.pow(2, attempt - 1);
+        console.warn(
+          `[anilist] returned ${res.status} on attempt ${attempt}/${MAX_RETRIES} — retrying in ${backoffMs}ms`
+        );
+        await new Promise((r) => setTimeout(r, backoffMs));
+        lastReqAt = 0; // reset throttle so we don't double-wait
+        continue;
+      }
+
+      return { status: res.status, body: res.body };
+    } catch (err) {
+      lastErr = err;
+      const code = (err as NodeJS.ErrnoException)?.code;
+      const retryable = ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN'].includes(code || '');
+      if (attempt < MAX_RETRIES && retryable) {
+        const backoffMs = 500 * Math.pow(2, attempt - 1);
+        console.warn(
+          `[anilist] network error on attempt ${attempt}/${MAX_RETRIES}: ${code || (err as Error).message} — retrying in ${backoffMs}ms`
+        );
+        await new Promise((r) => setTimeout(r, backoffMs));
+        lastReqAt = 0;
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  throw lastErr instanceof Error ? lastErr : new Error('anilistPost: max retries exceeded');
+}
+
+/**
+ * Run an AniList GraphQL query. Returns the `data` field of the GraphQL
+ * response (already unwrapped). Throws on transport errors or GraphQL errors.
+ */
+export async function anilistQuery<T = Record<string, unknown>>(
+  query: string,
+  variables: Record<string, unknown> = {},
+  timeoutMs = 15000
+): Promise<T> {
+  const url = new URL(ANILIST_URL);
+  const bodyStr = JSON.stringify({ query, variables });
+
+  const res = await anilistPost(url, bodyStr, timeoutMs);
 
   let parsed: { data?: T; errors?: Array<{ message: string }> };
   try {
-    parsed = JSON.parse(responseBody);
+    parsed = JSON.parse(res.body);
   } catch {
-    throw new Error(`AniList returned non-JSON response: ${responseBody.slice(0, 200)}`);
+    throw new Error(`AniList returned non-JSON response: ${res.body.slice(0, 200)}`);
   }
 
   if (parsed.errors && parsed.errors.length > 0) {
@@ -110,7 +205,6 @@ export async function anilistQuery<T = Record<string, unknown>>(
 
   return parsed.data;
 }
-
 // ============================================================
 // GraphQL queries
 // ============================================================
